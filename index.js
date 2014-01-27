@@ -2,6 +2,7 @@ var path = require('path');
 var util = require('util');
 var moment = require('moment');
 var nodemailer = require("nodemailer");
+var url = require('url');
 
 var Console = require('./lib/console');
 var File = require('./lib/file');
@@ -351,7 +352,7 @@ Bucker.prototype.email = function () {
         // shut down the connection pool, no more messages
         transport.close();
     });
-    
+
     self._lastEmail = moment();
     return self;
 };
@@ -361,53 +362,65 @@ exports.register = function (plugin, options, next) {
     // get/make bucker object
     var bucker;
 
+    var hapiLog = function (event, tags) {
+        var data;
+        var level = 'info'; //Default
+        // this is done intentionally so if multiple levels
+        // are declared, the one with highest priority will be used
+        if (tags.debug) level = 'debug';
+        if (tags.info) level = 'info';
+        if (tags.warn) level = 'warn';
+        if (tags.error) level = 'error';
+        event.tags = event.tags.filter(function (tag) {
+            return !~['error', 'warn', 'info', 'debug'].indexOf(tag);
+        });
+        data = util.format(event.data);
+        bucker.tags(event.tags)[level](data);
+    };
+
     if (options instanceof Bucker) {
         bucker = options;
         options = bucker.options;
     } else {
         bucker = new Bucker(options);
     }
+
     // access logger
-    plugin.events.on('response', function (req) {
-        var access = {
-            remote_ip: req.info.remoteAddress,
-            time: new Date(),
-            method: req.method.toUpperCase(),
-            url: req.url.path,
-            http_ver: req.raw.req.httpVersion,
-            referer: req.raw.req.headers.referer || req.raw.req.headers.referrer || '-',
-            agent: req.raw.req.headers['user-agent'],
-            length: req._response._headers['Content-Length'],
-            status: req._response._code,
-            response_time: new Date().getTime() - req.info.received + 'ms'
-        };
-        bucker.access(access);
+    plugin.events.on('request', function (request, event, tags) {
+        var level;
+        //First check for hapi response events
+        if (tags.hapi && tags.response) {
+            var access = {
+                remote_ip: request.info.remoteAddress,
+                time: new Date(event.timestamp),
+                method: request.method.toUpperCase(),
+                url: request.url.path,
+                agent: request.headers['user-agent'],
+                referer: request.headers.referer || request.headers.referrer || '-',
+                http_ver: request.raw.req.httpVersion,
+                length: request.response.headers['content-length'],
+                status: request.response.statusCode,
+                response_time: new Date().getTime() - request.info.received + 'ms'
+            };
+            return bucker.access(access);
+        }
+        //If we have an explicitly defined tag that is a loglevel, log it.
+        if ((!options.hapi || (options.hapi && options.hapi.handleLog)) && (tags.debug || tags.info || tags.warn || tags.error)) {
+            hapiLog(event, tags);
+        }
     });
     // add listener by default but dont if its false
     if (!options.hapi || (options.hapi && options.hapi.handleLog)) {
-        plugin.events.on('log', function (event, tags) {
-            var level;
-            var data = '';
-            // this is done intentionally so if multiple levels
-            // are declared, the one with highest priority will be used
-            if (tags.debug) level = 'debug';
-            if (tags.info) level = 'info';
-            if (tags.warn) level = 'warn';
-            if (tags.error) level = 'error';
-            if (!level) level = 'info';
-            event.tags = event.tags.filter(function (tag) {
-                return !~['error', 'warn', 'info', 'debug'].indexOf(tag);
-            });
-            data += util.format(event.data);
-            bucker.tags(event.tags)[level](data);
+        plugin.events.on('log', function (event, tags, timestamp) {
+            hapiLog(event, tags);
         });
 
         plugin.events.on('internalError', function (event, error) {
-            bucker.exception({ message: error.message, stack: error.trace });
+            bucker.exception({ message: error.message, stack: error.stack });
         });
     }
     // and attach ourselves to server.plugins.bucker
-    plugin.api(bucker);
+    plugin.expose(bucker);
     return next();
 };
 
